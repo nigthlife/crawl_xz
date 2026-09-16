@@ -170,13 +170,4 @@ jobs:
             git push
           fi
       
-      - name: 上传爬取日志
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: crawl-logs
-          path: |
-            xianzhi/*.md
-            butian/*.md
-          retention-days: 7
 
