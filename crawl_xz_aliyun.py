@@ -32,12 +32,25 @@ __version__ = '1.0'
 __author__ = 'AI Assistant'
 __date__ = '2025-10-31'
 
-def filename_filter(filename):  
-    """过滤文件名中的非法字符"""
-    string1="\/:*?\"<>|"
-    for s1 in string1:
-        filename= filename.replace(s1," ")
-    return filename.strip()
+def filename_filter(filename):
+    """生成跨平台安全的文件名"""
+    if not filename:
+        return "untitled"
+
+    # GitHub Artifact / Windows / Linux 不兼容字符
+    # 包括换行、回车、Tab、控制字符以及 <>:"/\|?*
+    filename = re.sub(r'[\x00-\x1f\x7f<>:"/\\|?*]+', ' ', filename)
+
+    # 连续空白压缩成一个空格
+    filename = re.sub(r'\s+', ' ', filename)
+
+    # 去掉文件名前后的空格和点
+    filename = filename.strip(' .')
+
+    # 防止超长文件名
+    filename = filename[:180]
+
+    return filename or "untitled"
 
 def html_to_pdf(html_content, output_path, title="", keep_html=True):
     """直接将HTML内容转换为PDF（更好地保留原始格式）
