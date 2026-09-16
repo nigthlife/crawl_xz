@@ -1,0 +1,317 @@
+name: 审计异常文件名
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v6
+
+      - name: 扫描所有 Git 文件名
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import subprocess
+          import re
+          import unicodedata
+          import json
+          import collections
+          from datetime import datetime, timezone
+
+          raw = subprocess.check_output(["git", "ls-files", "-z"])
+          paths = [
+              p.decode("utf-8", errors="surrogateescape")
+              for p in raw.split(b"\0")
+              if p
+          ]
+
+          # Windows 文件名禁止字符
+          # / 本身是 Git 路径分隔符，所以这里只检查每一级文件名
+          WINDOWS_FORBIDDEN = set('<>:"\\|?*')
+
+          # Windows 保留设备名
+          RESERVED = re.compile(
+              r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)',
+              re.IGNORECASE
+          )
+
+          results = []
+
+          for path in paths:
+              issues = []
+
+              for component in path.split("/"):
+
+                  # ------------------------
+                  # 1. 控制字符
+                  # ------------------------
+
+                  if "\n" in component:
+                      issues.append("包含 LF 换行符 \\\\n")
+
+                  if "\r" in component:
+                      issues.append("包含 CR 回车符 \\\\r")
+
+                  if "\t" in component:
+                      issues.append("包含 TAB 制表符 \\\\t")
+
+                  controls = sorted({
+                      ord(c)
+                      for c in component
+                      if ord(c) < 32 or ord(c) == 127
+                  })
+
+                  if controls:
+                      issues.append(
+                          "包含 ASCII 控制字符: " +
+                          ", ".join(f"U+{c:04X}" for c in controls)
+                      )
+
+                  # ------------------------
+                  # 2. Windows 非法字符
+                  # ------------------------
+
+                  bad = sorted(set(component) & WINDOWS_FORBIDDEN)
+
+                  if bad:
+                      issues.append(
+                          "包含 Windows 非法字符: " +
+                          " ".join(repr(c) for c in bad)
+                      )
+
+                  # ------------------------
+                  # 3. 首尾特殊情况
+                  # ------------------------
+
+                  if component.startswith(" "):
+                      issues.append("文件名以空格开头")
+
+                  if component.endswith(" "):
+                      issues.append("文件名以空格结尾")
+
+                  if component.endswith("."):
+                      issues.append("文件名以点结尾")
+
+                  # ------------------------
+                  # 4. Windows 保留文件名
+                  # ------------------------
+
+                  check_name = component.rstrip(" .")
+
+                  if RESERVED.match(check_name):
+                      issues.append("Windows 保留设备文件名")
+
+                  # ------------------------
+                  # 5. Unicode 不可见字符
+                  # ------------------------
+
+                  invisible = []
+
+                  for c in component:
+                      category = unicodedata.category(c)
+
+                      if category == "Cf":
+                          invisible.append(c)
+
+                  if invisible:
+                      desc = []
+
+                      for c in sorted(set(invisible), key=ord):
+                          desc.append(
+                              f"U+{ord(c):04X} "
+                              f"{unicodedata.name(c, 'UNKNOWN')}"
+                          )
+
+                      issues.append(
+                          "包含不可见 Unicode 格式字符: " +
+                          ", ".join(desc)
+                      )
+
+                  # ------------------------
+                  # 6. Unicode 规范化
+                  # ------------------------
+
+                  if unicodedata.normalize("NFC", component) != component:
+                      issues.append("Unicode 文件名不是 NFC 规范形式")
+
+                  # ------------------------
+                  # 7. 超长文件名
+                  # ------------------------
+
+                  byte_len = len(
+                      component.encode(
+                          "utf-8",
+                          errors="surrogateescape"
+                      )
+                  )
+
+                  if byte_len > 240:
+                      issues.append(
+                          f"单级文件名过长: {byte_len} bytes"
+                      )
+
+                  # ------------------------
+                  # 8. 连续空格
+                  # ------------------------
+
+                  if "  " in component:
+                      issues.append("文件名包含连续多个空格")
+
+              # 完整路径过长
+              path_len = len(
+                  path.encode(
+                      "utf-8",
+                      errors="surrogateescape"
+                  )
+              )
+
+              if path_len > 240:
+                  issues.append(
+                      f"完整路径较长: {path_len} bytes"
+                  )
+
+              if issues:
+                  results.append((path, sorted(set(issues))))
+
+          # ------------------------
+          # 9. Windows 大小写冲突
+          # ------------------------
+
+          case_map = collections.defaultdict(list)
+
+          for path in paths:
+              case_map[path.casefold()].append(path)
+
+          case_collisions = [
+              v for v in case_map.values()
+              if len(v) > 1
+          ]
+
+          # ------------------------
+          # 10. Unicode NFC 冲突
+          # ------------------------
+
+          nfc_map = collections.defaultdict(list)
+
+          for path in paths:
+              key = unicodedata.normalize("NFC", path).casefold()
+              nfc_map[key].append(path)
+
+          unicode_collisions = [
+              v for v in nfc_map.values()
+              if len(v) > 1
+          ]
+
+          # ------------------------
+          # 输出报告
+          # ------------------------
+
+          def show_path(path):
+              # JSON 可以确保 \n \r \t 被显示出来，
+              # 而不是真的换行
+              return json.dumps(
+                  path,
+                  ensure_ascii=False
+              )
+
+          lines = []
+
+          lines.append("# 文件名兼容性审计报告")
+          lines.append("")
+          lines.append(
+              f"- 扫描时间："
+              f"{datetime.now(timezone.utc).isoformat()}"
+          )
+          lines.append(
+              f"- Git 跟踪文件总数：{len(paths)}"
+          )
+          lines.append(
+              f"- 可疑路径数量：{len(results)}"
+          )
+          lines.append(
+              f"- 大小写冲突组：{len(case_collisions)}"
+          )
+          lines.append(
+              f"- Unicode 冲突组：{len(unicode_collisions)}"
+          )
+          lines.append("")
+
+          lines.append("## 一、异常或可疑文件名")
+          lines.append("")
+
+          if not results:
+              lines.append("未发现异常。")
+          else:
+              for index, (path, issues) in enumerate(
+                  results, 1
+              ):
+                  lines.append(
+                      f"### {index}. `{show_path(path)}`"
+                  )
+
+                  for issue in issues:
+                      lines.append(f"- {issue}")
+
+                  lines.append("")
+
+          lines.append("## 二、Windows 大小写冲突")
+          lines.append("")
+
+          if not case_collisions:
+              lines.append("未发现。")
+          else:
+              for group in case_collisions:
+                  lines.append("- 冲突组：")
+
+                  for path in group:
+                      lines.append(
+                          f"  - `{show_path(path)}`"
+                      )
+
+          lines.append("")
+          lines.append("## 三、Unicode 规范化冲突")
+          lines.append("")
+
+          if not unicode_collisions:
+              lines.append("未发现。")
+          else:
+              for group in unicode_collisions:
+                  lines.append("- 冲突组：")
+
+                  for path in group:
+                      lines.append(
+                          f"  - `{show_path(path)}`"
+                      )
+
+          report = "\n".join(lines)
+
+          with open(
+              "filename-audit-report.md",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(report)
+
+          print(report)
+
+          # 同时显示在 GitHub Actions Summary
+          import os
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          if summary:
+              with open(
+                  summary,
+                  "a",
+                  encoding="utf-8"
+              ) as f:
+                  f.write(report)
+
+          PY
